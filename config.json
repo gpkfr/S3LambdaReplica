@@ -1,0 +1,8 @@
+{
+  "gtcpsrc": {
+    "region": "us-east-1",
+    "destinations": [
+      "gtcpdest"
+  ]
+  }
+}
