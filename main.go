@@ -26,6 +26,8 @@ type Config struct {
 
 var config map[string]Config
 
+//parseConfig : Get and parse the config from URL (Set by CONFIG_URL ENV) or Decode the Base64's value of
+// CONFIG ENV.
 func parseConfig() (err error) {
 	//First we make the hash (map)
 	config = make(map[string]Config)
@@ -81,7 +83,7 @@ func parseConfig() (err error) {
 	}
 
 	//then we unmarshal data to config hash table
-	json.Unmarshal(data, &config)
+	err = json.Unmarshal(data, &config)
 	if err != nil {
 		return fmt.Errorf("Error unmarshal %v", err)
 	}
@@ -100,8 +102,7 @@ func HandleEvent(Ctx context.Context, event interface{}) error {
 
 	e, s3Event := event.(map[string]interface{}), events.S3Event{}
 
-	if mapstructure.Decode(e, &s3Event); len(s3Event.Records) > 0 && s3Event.Records[0].S3.Object.Key != "" {
-		log.Println("S3 events received")
+	if _ = mapstructure.Decode(e, &s3Event); len(s3Event.Records) > 0 && s3Event.Records[0].S3.Object.Key != "" {
 		return processS3Event(s3Event)
 	}
 	return nil
@@ -109,30 +110,62 @@ func HandleEvent(Ctx context.Context, event interface{}) error {
 
 func processS3Event(s3evt events.S3Event) (err error) {
 	//make a channel for err
-	errChan := make(chan error)
 
-	// read events
-	for _, v := range s3evt.Records {
-		log.Println("Moving", v.S3.Bucket.Name, v.S3.Object.Key, "To", config[v.S3.Bucket.Name].Destinations)
-		//open an aws Session
-		sess, err := session.NewSession(&aws.Config{Region: aws.String(config[v.S3.Bucket.Name].Region)})
-		if err != nil {
-			return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
-		}
-		// go into Destinations
-		for _, v1 := range config[v.S3.Bucket.Name].Destinations {
-			go copyObject(s3.New(sess), v.S3.Bucket.Name, v1, v.S3.Object.Key, errChan)
-		}
-	}
+	eventName := "s3:" + s3evt.Records[0].EventName
+	var sAction string
+	//log the kind of event
+	log.Printf("S3 event : %s", eventName)
 
-	for _, v := range s3evt.Records {
-		for range config[v.S3.Bucket.Name].Destinations {
-			err = <-errChan
+	switch eventName {
+	case s3.EventS3ObjectCreatedPut:
+		errChan := make(chan error)
+		sAction = "Copying"
+		// read events
+		for _, v := range s3evt.Records {
+			log.Println(sAction, v.S3.Bucket.Name, v.S3.Object.Key, "To", config[v.S3.Bucket.Name].Destinations)
+			//open an aws Session
+			sess, err := session.NewSession(&aws.Config{Region: aws.String(config[v.S3.Bucket.Name].Region)})
 			if err != nil {
-				return err
+				return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
+			}
+			// go into Destinations
+			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
+				go copyObject(s3.New(sess), v.S3.Bucket.Name, v1, v.S3.Object.Key, errChan)
 			}
 		}
+		for _, v := range s3evt.Records {
+			for range config[v.S3.Bucket.Name].Destinations {
+				err = <-errChan
+				if err != nil {
+					return err
+				}
+			}
+		}
+	case s3.EventS3ObjectRemovedDeleteMarkerCreated:
+		errChan := make(chan error)
+		sAction = "Deleting"
+		for _, v := range s3evt.Records {
+			log.Println(sAction, v.S3.Bucket.Name, v.S3.Object.Key, "from", config[v.S3.Bucket.Name].Destinations)
+			sess, err := session.NewSession(&aws.Config{Region: aws.String(config[v.S3.Bucket.Name].Region)})
+			if err != nil {
+				return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
+			}
+			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
+				go removeObject(s3.New(sess), v1, v.S3.Object.Key, errChan)
+			}
+		}
+		for _, v := range s3evt.Records {
+			for range config[v.S3.Bucket.Name].Destinations {
+				err = <-errChan
+				if err != nil {
+					return err
+				}
+			}
+		}
+	default:
+		sAction = eventName
 	}
+
 	return nil
 }
 
@@ -150,9 +183,22 @@ func copyObject(svc *s3.S3, from, to, item string, errChan chan error) {
 	}
 }
 
-/*func init() {
-	_ = os.Setenv("CONFIG", "ewogICJndGNwc3JjIjogewogICAgInJlZ2lvbiI6ICJ1cy1lYXN0LTEiLAogICAgImRlc3RpbmF0aW9ucyI6IFsKICAgICAgImd0Y3BkZXN0IgogIF0KICB9Cn0=")
-}*/
+func removeObject(svc *s3.S3, to, item string, errChan chan error) {
+	_, err := svc.DeleteObject(&s3.DeleteObjectInput{
+		Bucket: aws.String(to),
+		Key:    aws.String(item),
+	})
+
+	if err != nil {
+		errChan <- fmt.Errorf("Unable to delete %s in Bucket %q, %v", item, to, err)
+		return
+	}
+
+	err = svc.WaitUntilObjectNotExists(&s3.HeadObjectInput{
+		Bucket: aws.String(to),
+		Key:    aws.String(item),
+	})
+}
 
 func main() {
 	lambda.Start(HandleEvent)
