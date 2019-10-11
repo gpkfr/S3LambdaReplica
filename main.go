@@ -8,20 +8,23 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/mitchellh/mapstructure"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	s "strings"
 	"time"
 )
 
 type Config struct {
-	Region       string   `json:region`
-	Destinations []string `json:destinations`
+	Region       string   `json:"region"`
+	Destinations []string `json:"destinations"`
 }
 
 var config map[string]Config
@@ -66,7 +69,16 @@ func parseConfig() (err error) {
 
 		case "http":
 			fmt.Println("HTTP")
+			resp, err := http.Get(u.String())
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
 
+			data, err = ioutil.ReadAll(resp.Body)
+			if err != nil {
+				return err
+			}
 		default:
 			fmt.Println("Unsupported config url Scheme")
 		}
@@ -79,18 +91,18 @@ func parseConfig() (err error) {
 	}
 	// now we test if config is valid
 	if len(data) == 0 {
-		return fmt.Errorf("Unable to get configuration")
+		return fmt.Errorf("unable to get configuration")
 	}
 
 	//then we unmarshal data to config hash table
 	err = json.Unmarshal(data, &config)
 	if err != nil {
-		return fmt.Errorf("Error unmarshal %v", err)
+		return fmt.Errorf("error unmarshal %v", err)
 	}
 	//todo :
 	// avoid Cyclic ref
 	// S3 A -> B -> A
-	log.Println("Parseconfig ok")
+	log.Println("Parse config ok")
 	return nil
 }
 
@@ -105,32 +117,35 @@ func HandleEvent(Ctx context.Context, event interface{}) error {
 	if _ = mapstructure.Decode(e, &s3Event); len(s3Event.Records) > 0 && s3Event.Records[0].S3.Object.Key != "" {
 		return processS3Event(s3Event)
 	}
+	log.Println("Completed...")
 	return nil
 }
 
-func processS3Event(s3evt events.S3Event) (err error) {
-	//make a channel for err
+func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
+
+	var sAction string
 
 	eventName := "s3:" + s3evt.Records[0].EventName
-	var sAction string
+	log.Printf("S3evt : %q", s3evt.Records)
 	//log the kind of event
 	log.Printf("S3 event : %s", eventName)
 
+	errChan := make(chan error)
+
 	switch eventName {
-	case s3.EventS3ObjectCreatedPut:
-		errChan := make(chan error)
+	case s3.EventS3ObjectCreatedPut, s3.EventS3ObjectCreatedCopy:
 		sAction = "Copying"
-		// read events
 		for _, v := range s3evt.Records {
-			log.Println(sAction, v.S3.Bucket.Name, v.S3.Object.Key, "To", config[v.S3.Bucket.Name].Destinations)
-			//open an aws Session
-			sess, err := session.NewSession(&aws.Config{Region: aws.String(config[v.S3.Bucket.Name].Region)})
-			if err != nil {
-				return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
-			}
 			// go into Destinations
 			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
-				go copyObject(s3.New(sess), v.S3.Bucket.Name, v1, v.S3.Object.Key, errChan)
+				targetRegion, bucketDestination := getTargetRegion(v1, config[v.S3.Bucket.Name].Region)
+				log.Println(sAction, v.S3.Bucket.Name, v.S3.Object.Key, "To", bucketDestination[0], "In", targetRegion)
+				sess, err := session.NewSession(&aws.Config{Region: aws.String(targetRegion)})
+				if err != nil {
+					return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
+				}
+				go copyObject(s3.New(sess), v.S3.Bucket.Name, bucketDestination[0], v.S3.Object.Key, errChan)
+
 			}
 		}
 		for _, v := range s3evt.Records {
@@ -141,17 +156,19 @@ func processS3Event(s3evt events.S3Event) (err error) {
 				}
 			}
 		}
+
 	case s3.EventS3ObjectRemovedDeleteMarkerCreated:
-		errChan := make(chan error)
 		sAction = "Deleting"
 		for _, v := range s3evt.Records {
-			log.Println(sAction, v.S3.Bucket.Name, v.S3.Object.Key, "from", config[v.S3.Bucket.Name].Destinations)
-			sess, err := session.NewSession(&aws.Config{Region: aws.String(config[v.S3.Bucket.Name].Region)})
-			if err != nil {
-				return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
-			}
 			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
-				go removeObject(s3.New(sess), v1, v.S3.Object.Key, errChan)
+				targetRegion, bucketDestination := getTargetRegion(v1, config[v.S3.Bucket.Name].Region)
+				log.Println(sAction, v.S3.Bucket.Name, v.S3.Object.Key, "from", bucketDestination[0])
+				sess, err := session.NewSession(&aws.Config{Region: aws.String(targetRegion)})
+				if err != nil {
+					return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
+				}
+				go removeObject(s3.New(sess), bucketDestination[0], v.S3.Object.Key, errChan)
+
 			}
 		}
 		for _, v := range s3evt.Records {
@@ -162,17 +179,37 @@ func processS3Event(s3evt events.S3Event) (err error) {
 				}
 			}
 		}
+
 	default:
 		sAction = eventName
 	}
-
 	return nil
+}
+
+func getTargetRegion(targetBucket, defaultRegion string) (targetRegion string, bucketDestination []string) {
+	//Todo: Be more determinist with region
+	bucketDestination = s.Split(targetBucket, "@")
+	if len(bucketDestination) > 1 {
+		targetRegion = bucketDestination[1]
+	} else {
+		sess := session.Must(session.NewSession())
+		S3Region, err := s3manager.GetBucketRegion(aws.BackgroundContext(), sess, bucketDestination[0], "us-east-1")
+		if err != nil {
+			if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "NotFound" {
+				log.Printf("Unable to find bucket %s's region not found", bucketDestination[0])
+				//_, _ = fmt.Fprintf(os.Stderr, "unable to find bucket %s's region not found\n", bucketDestination[0])
+			}
+			os.Exit(2)
+		}
+		targetRegion = S3Region
+	}
+	return
 }
 
 func copyObject(svc *s3.S3, from, to, item string, errChan chan error) {
 	_, err := svc.CopyObject(&s3.CopyObjectInput{Bucket: aws.String(to), CopySource: aws.String(from + "/" + item), Key: aws.String(item)})
 	if err != nil {
-		errChan <- fmt.Errorf("Unable to copy %s from bucket %q to bucket %q, %v", item, from, to, err)
+		errChan <- fmt.Errorf("unable to copy %s from bucket %q to bucket %q, %v", item, from, to, err)
 		return
 	}
 
@@ -181,16 +218,19 @@ func copyObject(svc *s3.S3, from, to, item string, errChan chan error) {
 		errChan <- fmt.Errorf("error occured while waiting for item %q to be copied in bucket %q, %v", item, to, err)
 		return
 	}
+
+	errChan <- nil
+	return
 }
 
+// removeObject : Forward Deletion Event to Bucket DEST
 func removeObject(svc *s3.S3, to, item string, errChan chan error) {
 	_, err := svc.DeleteObject(&s3.DeleteObjectInput{
 		Bucket: aws.String(to),
 		Key:    aws.String(item),
 	})
-
 	if err != nil {
-		errChan <- fmt.Errorf("Unable to delete %s in Bucket %q, %v", item, to, err)
+		errChan <- fmt.Errorf("unable to delete %s in Bucket %q, %v", item, to, err)
 		return
 	}
 
@@ -198,6 +238,13 @@ func removeObject(svc *s3.S3, to, item string, errChan chan error) {
 		Bucket: aws.String(to),
 		Key:    aws.String(item),
 	})
+	if err != nil {
+		errChan <- fmt.Errorf("error occured while waiting for item %q to be removed in bucket %q, %v", item, to, err)
+		return
+	}
+
+	errChan <- nil
+	return
 }
 
 func main() {
