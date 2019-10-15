@@ -30,8 +30,8 @@ type Config struct {
 
 var config map[string]Config
 
-//parseConfig : Get and parse the config from URL (Set by CONFIG_URL ENV) or Decode the Base64's value of
-// CONFIG ENV.
+//parseConfig : Get and parse the config from URL (Set by CONFIG_URL ENV) or
+// Decode the Base64's value of CONFIG ENV.
 func parseConfig() (err error) {
 	//First we make the hash (map)
 	config = make(map[string]Config)
