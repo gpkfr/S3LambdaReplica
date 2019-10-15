@@ -25,6 +25,7 @@ import (
 type Config struct {
 	Region       string   `json:"region"`
 	Destinations []string `json:"destinations"`
+	ACL string `json:"acl,omitempty"`
 }
 
 var config map[string]Config
@@ -124,6 +125,7 @@ func HandleEvent(Ctx context.Context, event interface{}) error {
 func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
 
 	var sAction string
+	var objectACL string
 
 	eventName := "s3:" + s3evt.Records[0].EventName
 	log.Printf("S3evt : %q", s3evt.Records)
@@ -136,6 +138,11 @@ func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
 	case s3.EventS3ObjectCreatedPut, s3.EventS3ObjectCreatedCopy:
 		sAction = "Copying"
 		for _, v := range s3evt.Records {
+			if config[v.S3.Bucket.Name].ACL != "" {
+				objectACL = config[v.S3.Bucket.Name].ACL
+			} else {
+				objectACL = "private"
+			}
 			// go into Destinations
 			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
 				targetRegion, bucketDestination := getTargetRegion(v1, config[v.S3.Bucket.Name].Region)
@@ -144,7 +151,7 @@ func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
 				if err != nil {
 					return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
 				}
-				go copyObject(s3.New(sess), v.S3.Bucket.Name, bucketDestination[0], v.S3.Object.Key, errChan)
+				go copyObject(s3.New(sess), v.S3.Bucket.Name, bucketDestination[0], v.S3.Object.Key, objectACL, errChan)
 
 			}
 		}
@@ -206,8 +213,9 @@ func getTargetRegion(targetBucket, defaultRegion string) (targetRegion string, b
 	return
 }
 
-func copyObject(svc *s3.S3, from, to, item string, errChan chan error) {
-	_, err := svc.CopyObject(&s3.CopyObjectInput{Bucket: aws.String(to), CopySource: aws.String(from + "/" + item), Key: aws.String(item)})
+func copyObject(svc *s3.S3, from, to, item, acl string, errChan chan error) {
+
+	_, err := svc.CopyObject(&s3.CopyObjectInput{Bucket: aws.String(to), CopySource: aws.String(from + "/" + item), Key: aws.String(item), ACL: aws.String(acl)})
 	if err != nil {
 		errChan <- fmt.Errorf("unable to copy %s from bucket %q to bucket %q, %v", item, from, to, err)
 		return
