@@ -25,7 +25,7 @@ import (
 type Config struct {
 	Region       string   `json:"region"`
 	Destinations []string `json:"destinations"`
-	ACL string `json:"acl,omitempty"`
+	ACL          string   `json:"acl,omitempty"`
 }
 
 var config map[string]Config
@@ -138,11 +138,13 @@ func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
 	case s3.EventS3ObjectCreatedPut, s3.EventS3ObjectCreatedCopy:
 		sAction = "Copying"
 		for _, v := range s3evt.Records {
+
 			if config[v.S3.Bucket.Name].ACL != "" {
 				objectACL = config[v.S3.Bucket.Name].ACL
 			} else {
-				objectACL = "private"
+				objectACL = ""
 			}
+
 			// go into Destinations
 			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
 				targetRegion, bucketDestination := getTargetRegion(v1, config[v.S3.Bucket.Name].Region)
@@ -169,7 +171,7 @@ func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
 		for _, v := range s3evt.Records {
 			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
 				targetRegion, bucketDestination := getTargetRegion(v1, config[v.S3.Bucket.Name].Region)
-				log.Println(sAction, v.S3.Bucket.Name, v.S3.Object.Key, "from", bucketDestination[0])
+				log.Println(sAction, v.S3.Bucket.Name, v.S3.Object.Key, "in", bucketDestination[0])
 				sess, err := session.NewSession(&aws.Config{Region: aws.String(targetRegion)})
 				if err != nil {
 					return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
@@ -213,18 +215,71 @@ func getTargetRegion(targetBucket, defaultRegion string) (targetRegion string, b
 	return
 }
 
-func copyObject(svc *s3.S3, from, to, item, acl string, errChan chan error) {
+func copyObjectACL(svc *s3.S3, fromBucket, toBucket, objectKey string) (err error) {
+	// Get existing ACL
+	result, err := svc.GetObjectAcl(&s3.GetObjectAclInput{Bucket: &fromBucket, Key: &objectKey})
+	if err != nil {
+		log.Printf("Unable to determine origin Acl for bucket: %s, key: %s", fromBucket, objectKey)
+		return err
+	}
 
-	_, err := svc.CopyObject(&s3.CopyObjectInput{Bucket: aws.String(to), CopySource: aws.String(from + "/" + item), Key: aws.String(item), ACL: aws.String(acl)})
+	owner := *result.Owner.DisplayName
+	ownerId := *result.Owner.ID
+	//existing grants
+	grants := result.Grants
+
+	params := &s3.PutObjectAclInput{
+		Bucket: aws.String(toBucket),
+		Key:    aws.String(objectKey),
+		AccessControlPolicy: &s3.AccessControlPolicy{
+			Grants: grants,
+			Owner: &s3.Owner{
+				DisplayName: &owner,
+				ID:          &ownerId,
+			},
+		},
+	}
+	_, err = svc.PutObjectAcl(params)
+	if err != nil {
+		log.Printf(err.Error())
+		return err
+	}
+	return nil
+}
+
+func copyObject(svc *s3.S3, from, to, item, acl string, errChan chan error) {
+	var copyObjectInput *s3.CopyObjectInput
+	if acl != "" {
+		copyObjectInput = &s3.CopyObjectInput{
+			Bucket:     aws.String(to),
+			CopySource: aws.String(from + "/" + item),
+			Key:        aws.String(item),
+			ACL:        aws.String(acl),
+		}
+	} else {
+		copyObjectInput = &s3.CopyObjectInput{
+			Bucket:     aws.String(to),
+			CopySource: aws.String(from + "/" + item),
+			Key:        aws.String(item),
+		}
+	}
+	_, err := svc.CopyObject(copyObjectInput)
 	if err != nil {
 		errChan <- fmt.Errorf("unable to copy %s from bucket %q to bucket %q, %v", item, from, to, err)
 		return
 	}
-
 	err = svc.WaitUntilObjectExists(&s3.HeadObjectInput{Bucket: aws.String(to), Key: aws.String(item)})
 	if err != nil {
 		errChan <- fmt.Errorf("error occured while waiting for item %q to be copied in bucket %q, %v", item, to, err)
 		return
+	}
+
+	if acl == "" {
+		err = copyObjectACL(svc, from, to, item)
+		if err != nil {
+			errChan <- fmt.Errorf("error occured while copying ACL for item %q in bucket %q, %v", item, to, err)
+			return
+		}
 	}
 
 	errChan <- nil
