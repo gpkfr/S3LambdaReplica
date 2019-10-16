@@ -118,7 +118,6 @@ func HandleEvent(Ctx context.Context, event interface{}) error {
 	if _ = mapstructure.Decode(e, &s3Event); len(s3Event.Records) > 0 && s3Event.Records[0].S3.Object.Key != "" {
 		return processS3Event(s3Event)
 	}
-	log.Println("Completed...")
 	return nil
 }
 
@@ -147,14 +146,15 @@ func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
 
 			// go into Destinations
 			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
+				objectKey, _ := url.QueryUnescape(v.S3.Object.Key)
+
 				targetRegion, bucketDestination := getTargetRegion(v1, config[v.S3.Bucket.Name].Region)
-				log.Println(sAction, v.S3.Bucket.Name, v.S3.Object.Key, "To", bucketDestination[0], "In", targetRegion)
+				log.Println(sAction, v.S3.Bucket.Name, objectKey, "To", bucketDestination[0], "In", targetRegion)
 				sess, err := session.NewSession(&aws.Config{Region: aws.String(targetRegion)})
 				if err != nil {
 					return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
 				}
-				go copyObject(s3.New(sess), v.S3.Bucket.Name, bucketDestination[0], v.S3.Object.Key, objectACL, errChan)
-
+				go copyObject(s3.New(sess), v.S3.Bucket.Name, bucketDestination[0], objectKey, objectACL, errChan)
 			}
 		}
 		for _, v := range s3evt.Records {
@@ -170,13 +170,14 @@ func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
 		sAction = "Deleting"
 		for _, v := range s3evt.Records {
 			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
+				objectKey, _ := url.QueryUnescape(v.S3.Object.Key)
 				targetRegion, bucketDestination := getTargetRegion(v1, config[v.S3.Bucket.Name].Region)
-				log.Println(sAction, v.S3.Bucket.Name, v.S3.Object.Key, "in", bucketDestination[0])
+				log.Println(sAction, v.S3.Bucket.Name, objectKey, "in", bucketDestination[0])
 				sess, err := session.NewSession(&aws.Config{Region: aws.String(targetRegion)})
 				if err != nil {
 					return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
 				}
-				go removeObject(s3.New(sess), bucketDestination[0], v.S3.Object.Key, errChan)
+				go removeObject(s3.New(sess), bucketDestination[0], objectKey, errChan)
 
 			}
 		}
@@ -216,12 +217,41 @@ func getTargetRegion(targetBucket, defaultRegion string) (targetRegion string, b
 }
 
 func copyObjectACL(svc *s3.S3, fromBucket, toBucket, objectKey string) (err error) {
+	var result *s3.GetObjectAclOutput
+
+	log.Printf("Apply ACL to %s from %s", toBucket, fromBucket)
 	// Get existing ACL
-	result, err := svc.GetObjectAcl(&s3.GetObjectAclInput{Bucket: &fromBucket, Key: &objectKey})
+	sess := session.Must(session.NewSession())
+
+	S3Region, err := s3manager.GetBucketRegion(aws.BackgroundContext(), sess, fromBucket, "us-east-1")
 	if err != nil {
-		log.Printf("Unable to determine origin Acl for bucket: %s, key: %s", fromBucket, objectKey)
-		return err
+		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "NotFound" {
+			log.Printf("Unable to find bucket %s's region not found", fromBucket)
+		}
+		os.Exit(2)
 	}
+	if S3Region == aws.StringValue(svc.Config.Region) {
+		result, err = svc.GetObjectAcl(&s3.GetObjectAclInput{Bucket: aws.String(fromBucket), Key: aws.String(objectKey)})
+		if err != nil {
+			log.Printf("Unable to determine origin Acl for bucket: %s, key: %s", fromBucket, objectKey)
+			return err
+		}
+	} else {
+		sess, err = session.NewSession(&aws.Config{Region: aws.String(S3Region)})
+		if err != nil {
+			return fmt.Errorf("unable to enstablish aws session for %v", fromBucket)
+		}
+		svcS3 := s3.New(sess)
+		result, err = svcS3.GetObjectAcl(&s3.GetObjectAclInput{Bucket: aws.String(fromBucket), Key: aws.String(objectKey)})
+		if err != nil {
+			log.Printf("Unable to determine origin Acl for bucket: %s, key: %s", fromBucket, objectKey)
+			return err
+		}
+
+	}
+
+
+
 
 	owner := *result.Owner.DisplayName
 	ownerId := *result.Owner.ID
@@ -252,14 +282,14 @@ func copyObject(svc *s3.S3, from, to, item, acl string, errChan chan error) {
 	if acl != "" {
 		copyObjectInput = &s3.CopyObjectInput{
 			Bucket:     aws.String(to),
-			CopySource: aws.String(from + "/" + item),
+			CopySource: aws.String(url.QueryEscape(from + "/" + item)),
 			Key:        aws.String(item),
 			ACL:        aws.String(acl),
 		}
 	} else {
 		copyObjectInput = &s3.CopyObjectInput{
 			Bucket:     aws.String(to),
-			CopySource: aws.String(from + "/" + item),
+			CopySource: aws.String(url.QueryEscape(from + "/" + item)),
 			Key:        aws.String(item),
 		}
 	}
