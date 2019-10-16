@@ -5,9 +5,9 @@ cd bin &&
 zip function.zip main
 ```
 # ENV
-1. `CONFIG_URL` with an URL
+1. ```CONFIG_URL``` with an URL
 
-2. `CONFIG` with Base64 Json config encoded
+2. ```CONFIG``` with Base64 Json config encoded
 
 ### Config json :
 
@@ -25,3 +25,7 @@ zip function.zip main
     }
 }
 ```
+
+- Note :
+
+If you do not set the field "ACL", the function try to replicate the original acl.
