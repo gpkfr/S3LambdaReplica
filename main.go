@@ -146,13 +146,15 @@ func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
 
 			// go into Destinations
 			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
+				objectKey, _ := url.QueryUnescape(v.S3.Object.Key)
+
 				targetRegion, bucketDestination := getTargetRegion(v1, config[v.S3.Bucket.Name].Region)
-				log.Println(sAction, v.S3.Bucket.Name, s.ReplaceAll(v.S3.Object.Key,"+"," "), "To", bucketDestination[0], "In", targetRegion)
+				log.Println(sAction, v.S3.Bucket.Name, objectKey, "To", bucketDestination[0], "In", targetRegion)
 				sess, err := session.NewSession(&aws.Config{Region: aws.String(targetRegion)})
 				if err != nil {
 					return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
 				}
-				go copyObject(s3.New(sess), v.S3.Bucket.Name, bucketDestination[0], s.ReplaceAll(v.S3.Object.Key,"+"," "), objectACL, errChan)
+				go copyObject(s3.New(sess), v.S3.Bucket.Name, bucketDestination[0], objectKey, objectACL, errChan)
 			}
 		}
 		for _, v := range s3evt.Records {
@@ -168,13 +170,14 @@ func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
 		sAction = "Deleting"
 		for _, v := range s3evt.Records {
 			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
+				objectKey, _ := url.QueryUnescape(v.S3.Object.Key)
 				targetRegion, bucketDestination := getTargetRegion(v1, config[v.S3.Bucket.Name].Region)
-				log.Println(sAction, v.S3.Bucket.Name, s.ReplaceAll(v.S3.Object.Key,"+"," "), "in", bucketDestination[0])
+				log.Println(sAction, v.S3.Bucket.Name, objectKey, "in", bucketDestination[0])
 				sess, err := session.NewSession(&aws.Config{Region: aws.String(targetRegion)})
 				if err != nil {
 					return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
 				}
-				go removeObject(s3.New(sess), bucketDestination[0], s.ReplaceAll(v.S3.Object.Key,"+"," "), errChan)
+				go removeObject(s3.New(sess), bucketDestination[0], objectKey, errChan)
 
 			}
 		}
@@ -279,14 +282,14 @@ func copyObject(svc *s3.S3, from, to, item, acl string, errChan chan error) {
 	if acl != "" {
 		copyObjectInput = &s3.CopyObjectInput{
 			Bucket:     aws.String(to),
-			CopySource: aws.String(from + "/" + item),
+			CopySource: aws.String(url.QueryEscape(from + "/" + item)),
 			Key:        aws.String(item),
 			ACL:        aws.String(acl),
 		}
 	} else {
 		copyObjectInput = &s3.CopyObjectInput{
 			Bucket:     aws.String(to),
-			CopySource: aws.String(from + "/" + item),
+			CopySource: aws.String(url.QueryEscape(from + "/" + item)),
 			Key:        aws.String(item),
 		}
 	}
