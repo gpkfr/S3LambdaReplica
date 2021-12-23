@@ -5,6 +5,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	s "strings"
+	"time"
+
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go/aws"
@@ -13,28 +22,21 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/mitchellh/mapstructure"
-	"io/ioutil"
-	"log"
-	"net/http"
-	"net/url"
-	"os"
-	s "strings"
-	"time"
 )
 
-type Config struct {
+type config struct {
 	Region       string   `json:"region"`
 	Destinations []string `json:"destinations"`
 	ACL          string   `json:"acl,omitempty"`
 }
 
-var config map[string]Config
+var configS3Replica map[string]config
 
 //parseConfig : Get and parse the config from URL (Set by CONFIG_URL ENV) or
 // Decode the Base64's value of CONFIG ENV.
 func parseConfig() (err error) {
 	//First we make the hash (map)
-	config = make(map[string]Config)
+	configS3Replica = make(map[string]config)
 	data := make([]byte, 0)
 
 	configURL := os.Getenv("CONFIG_URL")
@@ -44,7 +46,7 @@ func parseConfig() (err error) {
 			return err
 		}
 
-		if u.IsAbs() == false {
+		if !u.IsAbs() {
 			u.Scheme = "https"
 		}
 
@@ -96,7 +98,7 @@ func parseConfig() (err error) {
 	}
 
 	//then we unmarshal data to config hash table
-	err = json.Unmarshal(data, &config)
+	err = json.Unmarshal(data, &configS3Replica)
 	if err != nil {
 		return fmt.Errorf("error unmarshal %v", err)
 	}
@@ -107,7 +109,7 @@ func parseConfig() (err error) {
 	return nil
 }
 
-func HandleEvent(Ctx context.Context, event interface{}) error {
+func handleEvent(Ctx context.Context, event interface{}) error {
 	err := parseConfig()
 	if err != nil {
 		log.Fatal("ParseConfig Error")
@@ -121,7 +123,7 @@ func HandleEvent(Ctx context.Context, event interface{}) error {
 	return nil
 }
 
-func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
+func processS3Event(s3evt events.S3Event) (err error) {
 
 	var sAction string
 	var objectACL string
@@ -134,31 +136,50 @@ func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
 	errChan := make(chan error)
 
 	switch eventName {
-	case s3.EventS3ObjectCreatedPut, s3.EventS3ObjectCreatedCopy:
+	case s3.EventS3ObjectCreatedPut, s3.EventS3ObjectCreatedCopy, s3.EventS3ObjectTaggingPut:
 		sAction = "Copying"
 		for _, v := range s3evt.Records {
 
-			if config[v.S3.Bucket.Name].ACL != "" {
-				objectACL = config[v.S3.Bucket.Name].ACL
+			if configS3Replica[v.S3.Bucket.Name].ACL != "" {
+				objectACL = configS3Replica[v.S3.Bucket.Name].ACL
 			} else {
 				objectACL = ""
 			}
 
+			if eventName == s3.EventS3ObjectTaggingPut {
+				isCleanAWSSession, err := session.NewSession(&aws.Config{Region: aws.String(configS3Replica[v.S3.Bucket.Name].Region)})
+				if err != nil {
+					return fmt.Errorf("unable to establish aws session for %v while checking for virii tags.", configS3Replica[v.S3.Bucket.Name])
+				}
+
+				isClean, err := isS3Objectclean(s3.New(isCleanAWSSession), v.S3.Bucket.Name, v.S3.Object.Key)
+				if err != nil {
+					return fmt.Errorf("Unable to check if object is clean")
+				}
+
+				if !isClean {
+					return fmt.Errorf("object is INFECTED by a Virii. move to quarantine")
+				}
+			}
+
 			// go into Destinations
-			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
+			for _, v1 := range configS3Replica[v.S3.Bucket.Name].Destinations {
 				objectKey, _ := url.QueryUnescape(v.S3.Object.Key)
 
-				targetRegion, bucketDestination := getTargetRegion(v1, config[v.S3.Bucket.Name].Region)
+				targetRegion, bucketDestination := getTargetRegion(v1, configS3Replica[v.S3.Bucket.Name].Region)
 				log.Println(sAction, v.S3.Bucket.Name, objectKey, "To", bucketDestination[0], "In", targetRegion)
+
 				sess, err := session.NewSession(&aws.Config{Region: aws.String(targetRegion)})
 				if err != nil {
-					return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
+					return fmt.Errorf("unable to establish aws session for %v", configS3Replica[v.S3.Bucket.Name])
 				}
+
 				go copyObject(s3.New(sess), v.S3.Bucket.Name, bucketDestination[0], objectKey, objectACL, errChan)
 			}
 		}
+
 		for _, v := range s3evt.Records {
-			for range config[v.S3.Bucket.Name].Destinations {
+			for range configS3Replica[v.S3.Bucket.Name].Destinations {
 				err = <-errChan
 				if err != nil {
 					return err
@@ -169,31 +190,60 @@ func processS3Event(s3evt events.S3Event) (err error) { //make a channel for err
 	case s3.EventS3ObjectRemovedDeleteMarkerCreated:
 		sAction = "Deleting"
 		for _, v := range s3evt.Records {
-			for _, v1 := range config[v.S3.Bucket.Name].Destinations {
+			for _, v1 := range configS3Replica[v.S3.Bucket.Name].Destinations {
 				objectKey, _ := url.QueryUnescape(v.S3.Object.Key)
-				targetRegion, bucketDestination := getTargetRegion(v1, config[v.S3.Bucket.Name].Region)
+				targetRegion, bucketDestination := getTargetRegion(v1, configS3Replica[v.S3.Bucket.Name].Region)
 				log.Println(sAction, v.S3.Bucket.Name, objectKey, "in", bucketDestination[0])
 				sess, err := session.NewSession(&aws.Config{Region: aws.String(targetRegion)})
 				if err != nil {
-					return fmt.Errorf("unable to enstablish aws session for %v", config[v.S3.Bucket.Name])
+					return fmt.Errorf("unable to enstablish aws session for %v", configS3Replica[v.S3.Bucket.Name])
 				}
 				go removeObject(s3.New(sess), bucketDestination[0], objectKey, errChan)
 
 			}
 		}
+
 		for _, v := range s3evt.Records {
-			for range config[v.S3.Bucket.Name].Destinations {
+			for range configS3Replica[v.S3.Bucket.Name].Destinations {
 				err = <-errChan
 				if err != nil {
 					return err
 				}
 			}
 		}
-
-	default:
-		sAction = eventName
 	}
 	return nil
+}
+
+func isS3Objectclean(svc *s3.S3, sourceBucket, s3ObjectKey string) (bool, error) {
+	input := &s3.GetObjectTaggingInput{
+		Bucket: aws.String(sourceBucket),
+		Key:    aws.String(s3ObjectKey),
+	}
+
+	result, err := svc.GetObjectTagging(input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			default:
+				fmt.Println(aerr.Error())
+			}
+		} else {
+			// Print the error, cast err to awserr.Error to get the Code and
+			// Message from an error.
+			fmt.Println(err.Error())
+		}
+		return true, err
+	}
+
+	for _, v := range result.TagSet {
+
+		if strings.TrimRight(aws.StringValue(v.Value), "\n") == "infected" {
+			fmt.Println(aws.StringValue(v.Key) + ":" + aws.StringValue(v.Value))
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func getTargetRegion(targetBucket, defaultRegion string) (targetRegion string, bucketDestination []string) {
@@ -250,11 +300,8 @@ func copyObjectACL(svc *s3.S3, fromBucket, toBucket, objectKey string) (err erro
 
 	}
 
-
-
-
 	owner := *result.Owner.DisplayName
-	ownerId := *result.Owner.ID
+	ownerID := *result.Owner.ID
 	//existing grants
 	grants := result.Grants
 
@@ -265,19 +312,20 @@ func copyObjectACL(svc *s3.S3, fromBucket, toBucket, objectKey string) (err erro
 			Grants: grants,
 			Owner: &s3.Owner{
 				DisplayName: &owner,
-				ID:          &ownerId,
+				ID:          &ownerID,
 			},
 		},
 	}
 	_, err = svc.PutObjectAcl(params)
 	if err != nil {
-		log.Printf(err.Error())
+		log.Printf("%s", err.Error())
 		return err
 	}
 	return nil
 }
 
 func copyObject(svc *s3.S3, from, to, item, acl string, errChan chan error) {
+
 	var copyObjectInput *s3.CopyObjectInput
 	if acl != "" {
 		copyObjectInput = &s3.CopyObjectInput{
@@ -293,6 +341,7 @@ func copyObject(svc *s3.S3, from, to, item, acl string, errChan chan error) {
 			Key:        aws.String(item),
 		}
 	}
+
 	_, err := svc.CopyObject(copyObjectInput)
 	if err != nil {
 		errChan <- fmt.Errorf("unable to copy %s from bucket %q to bucket %q, %v", item, from, to, err)
@@ -313,7 +362,6 @@ func copyObject(svc *s3.S3, from, to, item, acl string, errChan chan error) {
 	}
 
 	errChan <- nil
-	return
 }
 
 // removeObject : Forward Deletion Event to Bucket DEST
@@ -337,9 +385,8 @@ func removeObject(svc *s3.S3, to, item string, errChan chan error) {
 	}
 
 	errChan <- nil
-	return
 }
 
 func main() {
-	lambda.Start(HandleEvent)
+	lambda.Start(handleEvent)
 }
